@@ -2,12 +2,13 @@ import os
 import json
 import time
 import asyncio
-import aiohttp
 import logging
+import httpx  # Using httpx instead of aiohttp
 from datetime import datetime, timedelta
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
+import re
 
 # Load environment variables
 load_dotenv()
@@ -38,15 +39,16 @@ SENTIMENT_THRESHOLD = 20  # Minimum sentiment score to trigger a trade
 # Initialize Binance client
 binance_client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
-async def http_request_with_retry(session: aiohttp.ClientSession, method: str, url: str, **kwargs):
+async def http_request_with_retry(method: str, url: str, **kwargs):
     """
-    Make an HTTP request with retry logic.
+    Make an HTTP request with retry logic using httpx instead of aiohttp.
     """
     for attempt in range(3):
         try:
-            async with session.request(method, url, timeout=30, **kwargs) as response:
+            async with httpx.AsyncClient() as client:
+                response = await client.request(method, url, timeout=30, **kwargs)
                 response.raise_for_status()
-                return await response.json()
+                return response.json()
         except Exception as e:
             logger.error(f"Request failed (attempt {attempt+1}/3): {str(e)}")
             if attempt < 3 - 1:
@@ -60,7 +62,7 @@ async def get_twitter_data():
     """
     url = "https://apis.datura.ai/twitter"
     headers = {
-        "Authorization": DATURA_API_KEY,
+        "Authorization": DATURA_API_KEY,          
         "Content-Type": "application/json"
     }
     
@@ -82,14 +84,15 @@ async def get_twitter_data():
     }
     
     logger.info("Fetching tweets from Datura API")
-    async with aiohttp.ClientSession() as session:
-        try:
-            data = await http_request_with_retry(session, "POST", url, headers=headers, json=payload)
-            logger.info(f"Retrieved {len(data)} tweets")
-            return data
-        except Exception as e:
-            logger.error(f"Error fetching tweets: {str(e)}")
-            return []
+    try:
+        data = await http_request_with_retry("POST", url, headers=headers, json=payload)
+        logger.info(f"Retrieved {len(data)} tweets")
+        with open("tweets.json", "w") as f:
+            json.dump(data, f, indent=4)
+        return data
+    except Exception as e:
+        logger.error(f"Error fetching tweets: {str(e)}")
+        return []
 
 async def analyze_sentiment(tweets):
     """
@@ -113,35 +116,42 @@ async def analyze_sentiment(tweets):
     - Trader sentiment
     - News impact
     
-    Return only a single integer number between -100 and 100 representing the overall sentiment.
+    Return only a single integer number between -100 and 100 representing the overall sentiment. Nothing else.
     """
     
     logger.info("Analyzing sentiment with Chutes LLM")
     try:
-        async with aiohttp.ClientSession() as session:
-            url = "https://llm.chutes.ai/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {CHUTES_API_KEY}", "Content-Type": "application/json"}
-            payload = {
-                "model": "unsloth/gemma-3-4b-it",
-                "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                "max_tokens": 50,
-                "temperature": 0.3
-            }
-            
-            data = await http_request_with_retry(session, "POST", url, headers=headers, json=payload)
-            sentiment_text = data['choices'][0]['message']['content'].strip()
-            
-            # Extract the numeric sentiment score
-            try:
-                sentiment_score = int(''.join(filter(lambda x: x.isdigit() or x == '-', sentiment_text)))
+        url = "https://llm.chutes.ai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {CHUTES_API_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "unsloth/gemma-3-4b-it",
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "max_tokens": 50,
+            "temperature": 0.3
+        }
+        
+        data = await http_request_with_retry("POST", url, headers=headers, json=payload)
+        sentiment_text = data['choices'][0]['message']['content'].strip()
+        logger.info(f"Raw sentiment response: {sentiment_text}")
+        
+        # Extract the numeric sentiment score using regex to find the first number
+        try:
+            # Find all numbers (including negative) in the text
+            numbers = re.findall(r'-?\d+', sentiment_text)
+            if numbers:
+                # Use the first number found
+                sentiment_score = int(numbers[0])
                 # Ensure the score is within bounds
                 sentiment_score = max(-100, min(100, sentiment_score))
                 logger.info(f"Sentiment analysis complete. Score: {sentiment_score}")
                 return sentiment_score
-            except ValueError:
-                logger.error(f"Failed to parse sentiment score from: {sentiment_text}")
+            else:
+                logger.error(f"No numeric score found in: {sentiment_text}")
                 return 0
+        except ValueError as e:
+            logger.error(f"Failed to parse sentiment score: {e}")
+            return 0
     except Exception as e:
         logger.error(f"Error analyzing sentiment: {str(e)}")
         return 0
